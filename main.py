@@ -1,4 +1,3 @@
-
 import os
 import io
 import uuid
@@ -13,34 +12,32 @@ from pdf2image import convert_from_path
 from PIL import Image
 from openai import OpenAI
 
+# === ENV ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# === DIRECTORIES ===
 UPLOAD_DIR = "uploads"
 BUNDLE_DIR = "bundles"
-
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(BUNDLE_DIR, exist_ok=True)
 
+# === FASTAPI APP ===
 app = FastAPI(title="OCR Bundle API", version="1.0.0")
 
-
+# === UTILS ===
 def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[Image.Image]:
-    pages = convert_from_path(pdf_path, dpi=dpi)
-    return pages
-
+    return convert_from_path(pdf_path, dpi=dpi)
 
 def pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
-
 
 def ocr_page_with_vision(img: Image.Image) -> str:
     img_b64 = pil_to_base64(img)
@@ -66,8 +63,8 @@ def ocr_page_with_vision(img: Image.Image) -> str:
         ],
         max_tokens=4000,
     )
-    return resp.choices[0].message.content or ""
 
+    return resp.choices[0].message.content or ""
 
 def build_bundle(pdf_path: str, job_id: str) -> dict:
     workdir = os.path.join("work", job_id)
@@ -84,6 +81,7 @@ def build_bundle(pdf_path: str, job_id: str) -> dict:
 
     for idx, page_img in enumerate(pages, start=1):
         print(f"[{job_id}] OCR trang {idx}/{len(pages)}")
+
         warning: Optional[str] = None
         try:
             text = ocr_page_with_vision(page_img)
@@ -134,7 +132,7 @@ def build_bundle(pdf_path: str, job_id: str) -> dict:
 
     sample_table_meta = {
         "tables": [],
-        "note": 'Chưa implement nhận diện bảng chi tiết.'
+        "note": "Chưa implement nhận diện bảng chi tiết."
     }
     table_path = os.path.join(tables_dir, "table_001.json")
     with open(table_path, "w", encoding="utf-8") as f:
@@ -155,10 +153,10 @@ def build_bundle(pdf_path: str, job_id: str) -> dict:
         "zip_name": zip_name,
         "page_count": len(page_results),
         "total_chars": total_chars,
-        "warnings": [p['warning'] for p in page_results if p['warning']],
+        "warnings": [p["warning"] for p in page_results if p["warning"]],
     }
 
-
+# === ROUTES ===
 @app.post("/ocr/pdf")
 async def ocr_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
@@ -182,7 +180,6 @@ async def ocr_pdf(file: UploadFile = File(...)):
         "warnings": meta["warnings"],
     }
 
-
 @app.get("/files/{filename}")
 async def download_file(filename: str):
     file_path = os.path.join(BUNDLE_DIR, filename)
@@ -193,3 +190,7 @@ async def download_file(filename: str):
         media_type="application/zip",
         filename=filename
     )
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
