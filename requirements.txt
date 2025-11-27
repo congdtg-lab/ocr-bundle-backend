@@ -1,9 +1,6 @@
 fastapi==0.110.0
-uvicorn[standard]==0.29.0
-
+uvicorn==0.29.0
 openai==1.14.3
-
 Pillow==10.2.0
-PyMuPDF==1.24.0   # thay pdf2image – không cần Poppler
-
+PyMuPDF==1.24.0
 python-multipart==0.0.9
