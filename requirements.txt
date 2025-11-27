@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+openai>=1.6.0
+pdf2image
+pillow
+python-multipart
