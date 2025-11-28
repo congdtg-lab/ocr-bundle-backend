@@ -1,175 +1,180 @@
 import os
 import uuid
 import shutil
-import fitz  # PyMuPDF
+import fitz   # PyMuPDF
 import zipfile
 import tempfile
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import requests
+from openai import OpenAI
 
 # =========================
-# CONFIG
+# INITIAL SETUP
 # =========================
-BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "http://localhost:8000")
-if BASE_URL.startswith("http"):
-    BASE_URL = BASE_URL.rstrip("/")
 
 app = FastAPI()
 
+# Allow all CORS (for ChatGPT actions)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# =========================
-# Pydantic model (URL Mode)
-# =========================
-class OCRUrlRequest(BaseModel):
-    file_url: str
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 # =========================
-# Helper: Convert PDF to Images
+# MODELS
 # =========================
-def pdf_to_images(pdf_path, output_folder):
-    doc = fitz.open(pdf_path)
-    image_paths = []
 
-    for i, page in enumerate(doc):
-        pix = page.get_pixmap(dpi=200)
-        img_path = os.path.join(output_folder, f"media/images/page_{i+1}.png")
-        os.makedirs(os.path.dirname(img_path), exist_ok=True)
-        pix.save(img_path)
-        image_paths.append(img_path)
-
-    return image_paths
+class OCRResponse(BaseModel):
+    download_url: str
 
 
 # =========================
-# Helper: Fake Vision OCR (placeholder)
+# ROOT + HEALTH
 # =========================
-def run_vision_ocr_on_image(image_path):
-    """
-    Placeholder OCR logic.
-    Bạn đang dùng GPT-4o Vision ở bản thật, nhưng ở backend mẫu này
-    mình giữ placeholder cho phù hợp.
 
-    Bạn sẽ thay bằng code OCR thực tế của bạn.
-    """
-    return f"OCR placeholder for {os.path.basename(image_path)}\n"
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "OCR Bundle Backend (Vercel)"}
 
 
-# =========================
-# Build OCR Bundle (ZIP)
-# =========================
-def build_bundle(pdf_path):
-    session_id = str(uuid.uuid4())
-    workdir = os.path.join("/tmp", f"ocr_{session_id}")
-    docs_dir = os.path.join(workdir, "docs")
-    tables_dir = os.path.join(workdir, "tables")
-    media_dir = os.path.join(workdir, "media")
-
-    os.makedirs(docs_dir, exist_ok=True)
-    os.makedirs(tables_dir, exist_ok=True)
-    os.makedirs(media_dir, exist_ok=True)
-
-    # 1. Convert PDF → Images
-    image_paths = pdf_to_images(pdf_path, workdir)
-
-    # 2. OCR từng ảnh
-    raw_text = ""
-    structure = []
-    warnings = []
-
-    for idx, img in enumerate(image_paths):
-        try:
-            text = run_vision_ocr_on_image(img)
-            raw_text += f"\n\n# Page {idx+1}\n{text}"
-
-            structure.append({
-                "page": idx + 1,
-                "image": img,
-                "text_length": len(text)
-            })
-
-        except Exception as e:
-            warnings.append(f"Page {idx+1}: OCR error {str(e)}")
-
-    # 3. Save docs
-    with open(os.path.join(docs_dir, "raw_text.md"), "w", encoding="utf-8") as f:
-        f.write(raw_text)
-
-    import json
-    with open(os.path.join(docs_dir, "structure.json"), "w", encoding="utf-8") as f:
-        json.dump(structure, f, ensure_ascii=False, indent=2)
-
-    with open(os.path.join(docs_dir, "ocr_warnings.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(warnings))
-
-    # 4. Create ZIP
-    zip_filename = f"ocr_bundle_{session_id}.zip"
-    zip_path = os.path.join("/tmp", zip_filename)
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(workdir):
-            for file in files:
-                full_path = os.path.join(root, file)
-                arcname = os.path.relpath(full_path, workdir)
-                zipf.write(full_path, arcname)
-
-    return zip_path
-
-
-# =========================
-# API: OCR via URL
-# =========================
-@app.post("/ocr/pdf")
-async def ocr_pdf_url(payload: OCRUrlRequest):
-    file_url = payload.file_url
-
-    # 1. Download PDF
-    try:
-        response = requests.get(file_url, timeout=15)
-        response.raise_for_status()
-        pdf_bytes = response.content
-    except Exception:
-        raise HTTPException(status_code=400, detail="Unable to download file_url")
-
-    # 2. Save temp PDF
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        pdf_path = tmp.name
-
-    # 3. Build OCR ZIP bundle
-    zip_path = build_bundle(pdf_path)
-    zip_filename = os.path.basename(zip_path)
-
-    # 4. Build URL for user to download ZIP
-    download_url = f"{BASE_URL}/files/{zip_filename}"
-
-    return {"download_url": download_url}
-
-
-# =========================
-# Serve ZIP files
-# =========================
-@app.get("/files/{filename}")
-async def download_file(filename: str):
-    file_path = os.path.join("/tmp", filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path, media_type="application/zip", filename=filename)
-
-
-# =========================
-# Health check
-# =========================
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# =========================
+# HELPER — RUN OCR VISION
+# =========================
+
+async def run_vision_ocr(image_bytes: bytes, page_number: int):
+    """
+    Calls OpenAI Vision to generate OCR text.
+    Returns pure text.
+    """
+    result = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are an OCR engine. Extract ALL visible text accurately."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"OCR page {page_number}. Return plain text only."},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{image_bytes.decode('latin1')}"}
+                ]
+            }
+        ]
+    )
+
+    return result.choices[0].message["content"]
+
+
+# =========================
+# BUILD OCR ZIP BUNDLE
+# =========================
+
+def build_zip_bundle(base_dir: str, zip_path: str):
+    """Zip toàn bộ bundle."""
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(base_dir):
+            for f in files:
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, base_dir)
+                z.write(full, rel)
+
+
+# =========================
+# OCR PDF ENDPOINT
+# =========================
+
+@app.post("/ocr/pdf", response_model=OCRResponse)
+async def ocr_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF.")
+
+    # Create temp workspace (serverless-compatible)
+    work_id = str(uuid.uuid4())
+    tmp_root = os.path.join("/tmp", work_id)
+    docs_dir = os.path.join(tmp_root, "docs")
+    media_dir = os.path.join(tmp_root, "media", "images")
+    tables_dir = os.path.join(tmp_root, "tables")
+
+    os.makedirs(docs_dir, exist_ok=True)
+    os.makedirs(media_dir, exist_ok=True)
+    os.makedirs(tables_dir, exist_ok=True)
+
+    pdf_path = os.path.join(tmp_root, "input.pdf")
+
+    # Save uploaded file
+    with open(pdf_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # Load PDF
+    doc = fitz.open(pdf_path)
+
+    raw_text_all = ""
+    warnings = []
+
+    # Iterate pages
+    for i, page in enumerate(doc):
+        page_num = i + 1
+
+        # Render page → PNG bytes
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+
+        # Save PNG file
+        img_out = os.path.join(media_dir, f"page_{page_num}.png")
+        pix.save(img_out)
+
+        # OCR via OpenAI Vision
+        try:
+            ocr_text = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "OCR engine. Extract ALL text accurately."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": f"OCR page {page_num}. Return plain text only."},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/png;base64,{img_bytes.decode('latin1')}"
+                            }
+                        ]
+                    }
+                ]
+            ).choices[0].message["content"]
+
+        except Exception as e:
+            ocr_text = ""
+            warnings.append(f"Page {page_num} OCR error: {str(e)}")
+
+        raw_text_all += f"\n\n# PAGE {page_num}\n" + ocr_text
+
+    # Save raw_text.md
+    with open(os.path.join(docs_dir, "raw_text.md"), "w", encoding="utf-8") as f:
+        f.write(raw_text_all)
+
+    # Save structure.json
+    with open(os.path.join(docs_dir, "structure.json"), "w", encoding="utf-8") as f:
+        f.write('{"pages": ' + str(doc.page_count) + '}')
+
+    # Save warnings
+    with open(os.path.join(docs_dir, "ocr_warnings.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(warnings))
+
+    # Build ZIP
+    zip_out = os.path.join(tmp_root, "bundle.zip")
+    build_zip_bundle(tmp_root, zip_out)
+
+    # Return downloadable URL
+    # Vercel serves static files via /api or /files – we use on-demand FileResponse fallback
+    return FileResponse(zip_out, filename="ocr_bundle.zip")
