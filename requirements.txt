@@ -1,7 +1,17 @@
 fastapi==0.110.0
 uvicorn==0.29.0
+
+# OpenAI SDK chuẩn new API
 openai==1.14.3
-httpx==0.27.2
-Pillow==10.2.0
+
+# PDF rendering for OCR
 PyMuPDF==1.24.0
+
+# Image handling
+Pillow==9.5.0
+
+# Upload handling
 python-multipart==0.0.9
+
+# Needed for FileResponse & zip operations
+requests==2.31.0
