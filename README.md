@@ -1,8 +1,3 @@
-Xin lỗi, có thể bạn chưa thấy rõ phần nội dung đầy đủ.
-Dưới đây là **TOÀN BỘ nội dung README.md mới**, trình bày rõ ràng – bạn chỉ cần **copy → paste** vào file README.md trong GitHub.
-
----
-
 # 📦 Knowledge File Builder — OCR Backend (Vercel Edition)
 
 Backend FastAPI sử dụng OpenAI Vision để OCR PDF và xuất ra một **ZIP bundle** chuẩn cho assistant “Knowledge File Builder Pro — Backend Edition”.
