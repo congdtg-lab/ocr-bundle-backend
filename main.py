@@ -1,238 +1,175 @@
 import os
-import io
 import uuid
-import base64
-import zipfile
-import json
-from typing import List, Optional
-
+import shutil
 import fitz  # PyMuPDF
-from PIL import Image
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import zipfile
+import tempfile
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from openai import OpenAI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
 
-# ===== ENVIRONMENT =====
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+# =========================
+# CONFIG
+# =========================
+BASE_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "http://localhost:8000")
+if BASE_URL.startswith("http"):
+    BASE_URL = BASE_URL.rstrip("/")
 
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+app = FastAPI()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ===== DIRECTORIES =====
-UPLOAD_DIR = "uploads"
-BUNDLE_DIR = "bundles"
-WORK_DIR = "work"
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(BUNDLE_DIR, exist_ok=True)
-os.makedirs(WORK_DIR, exist_ok=True)
-
-# ===== FASTAPI APP =====
-app = FastAPI(title="OCR Bundle API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# ============================================
-# PDF → Images bằng PyMuPDF (KHÔNG cần Poppler)
-# ============================================
-def pdf_to_images(pdf_path: str) -> List[Image.Image]:
+# =========================
+# Pydantic model (URL Mode)
+# =========================
+class OCRUrlRequest(BaseModel):
+    file_url: str
+
+
+# =========================
+# Helper: Convert PDF to Images
+# =========================
+def pdf_to_images(pdf_path, output_folder):
     doc = fitz.open(pdf_path)
-    imgs = []
+    image_paths = []
 
-    for page in doc:
-        pix = page.get_pixmap(dpi=300)
-        img_bytes = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_bytes))
-        imgs.append(img)
+    for i, page in enumerate(doc):
+        pix = page.get_pixmap(dpi=200)
+        img_path = os.path.join(output_folder, f"media/images/page_{i+1}.png")
+        os.makedirs(os.path.dirname(img_path), exist_ok=True)
+        pix.save(img_path)
+        image_paths.append(img_path)
 
-    doc.close()
-    return imgs
-
-
-# ============================================
-# Helper: PIL image → Base64 PNG
-# ============================================
-def pil_to_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+    return image_paths
 
 
-# ============================================
-# OCR bằng GPT-4o
-# ============================================
-def ocr_page_with_vision(img: Image.Image) -> str:
-    img_b64 = pil_to_base64(img)
+# =========================
+# Helper: Fake Vision OCR (placeholder)
+# =========================
+def run_vision_ocr_on_image(image_path):
+    """
+    Placeholder OCR logic.
+    Bạn đang dùng GPT-4o Vision ở bản thật, nhưng ở backend mẫu này
+    mình giữ placeholder cho phù hợp.
 
-    prompt = (
-        "Bạn là engine OCR. Hãy TRÍCH XUẤT CHÍNH XÁC toàn bộ văn bản có trong ảnh.\n"
-        "- Ngôn ngữ: Tiếng Việt + tiếng Anh.\n"
-        "- Không tóm tắt, không dịch.\n"
-        "- Không bỏ bớt nội dung.\n"
-        "- Trả về văn bản thuần (plain text).\n"
-    )
-
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": img_b64}},
-                ],
-            }
-        ],
-        max_tokens=4000,
-    )
-
-    return resp.choices[0].message.content or ""
+    Bạn sẽ thay bằng code OCR thực tế của bạn.
+    """
+    return f"OCR placeholder for {os.path.basename(image_path)}\n"
 
 
-# ============================================
-# Build OCR bundle ZIP
-# ============================================
-def build_bundle(pdf_path: str, job_id: str) -> dict:
-    workdir = os.path.join(WORK_DIR, job_id)
+# =========================
+# Build OCR Bundle (ZIP)
+# =========================
+def build_bundle(pdf_path):
+    session_id = str(uuid.uuid4())
+    workdir = os.path.join("/tmp", f"ocr_{session_id}")
     docs_dir = os.path.join(workdir, "docs")
     tables_dir = os.path.join(workdir, "tables")
-    media_dir = os.path.join(workdir, "media", "images")
+    media_dir = os.path.join(workdir, "media")
 
     os.makedirs(docs_dir, exist_ok=True)
     os.makedirs(tables_dir, exist_ok=True)
     os.makedirs(media_dir, exist_ok=True)
 
-    pages = pdf_to_images(pdf_path)
-    results = []
+    # 1. Convert PDF → Images
+    image_paths = pdf_to_images(pdf_path, workdir)
 
-    for idx, img in enumerate(pages, start=1):
-        print(f"[{job_id}] OCR trang {idx}/{len(pages)}")
-        warning = None
+    # 2. OCR từng ảnh
+    raw_text = ""
+    structure = []
+    warnings = []
 
+    for idx, img in enumerate(image_paths):
         try:
-            text = ocr_page_with_vision(img)
+            text = run_vision_ocr_on_image(img)
+            raw_text += f"\n\n# Page {idx+1}\n{text}"
+
+            structure.append({
+                "page": idx + 1,
+                "image": img,
+                "text_length": len(text)
+            })
+
         except Exception as e:
-            text = ""
-            warning = f"OCR error: {e}"
+            warnings.append(f"Page {idx+1}: OCR error {str(e)}")
 
-        results.append(
-            {
-                "page_number": idx,
-                "text": text,
-                "text_length": len(text),
-                "warning": warning,
-            }
-        )
+    # 3. Save docs
+    with open(os.path.join(docs_dir, "raw_text.md"), "w", encoding="utf-8") as f:
+        f.write(raw_text)
 
-        img_path = os.path.join(media_dir, f"page_{idx:03d}.png")
-        img.save(img_path, format="PNG")
+    import json
+    with open(os.path.join(docs_dir, "structure.json"), "w", encoding="utf-8") as f:
+        json.dump(structure, f, ensure_ascii=False, indent=2)
 
-    # ---- Save raw text ----
-    raw_text_path = os.path.join(docs_dir, "raw_text.md")
-    total_chars = 0
+    with open(os.path.join(docs_dir, "ocr_warnings.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(warnings))
 
-    with open(raw_text_path, "w", encoding="utf-8") as f:
-        for item in results:
-            f.write(f"<!-- Page {item['page_number']} -->\n")
-            f.write(item["text"])
-            f.write("\n\n")
-            total_chars += item["text_length"]
+    # 4. Create ZIP
+    zip_filename = f"ocr_bundle_{session_id}.zip"
+    zip_path = os.path.join("/tmp", zip_filename)
 
-    # ---- Structure JSON ----
-    struct_path = os.path.join(docs_dir, "structure.json")
-    with open(struct_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "pages": [
-                    {
-                        "page_number": item["page_number"],
-                        "text_length": item["text_length"],
-                        "has_warning": item["warning"] is not None,
-                    }
-                    for item in results
-                ]
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(workdir):
+            for file in files:
+                full_path = os.path.join(root, file)
+                arcname = os.path.relpath(full_path, workdir)
+                zipf.write(full_path, arcname)
 
-    # ---- Warnings ----
-    warn_path = os.path.join(docs_dir, "ocr_warnings.txt")
-    with open(warn_path, "w", encoding="utf-8") as f:
-        for item in results:
-            if item["warning"]:
-                f.write(f"Trang {item['page_number']}: {item['warning']}\n")
-
-    # ---- Sample table placeholder ----
-    table_path = os.path.join(tables_dir, "table_001.json")
-    with open(table_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"tables": [], "note": "Chưa implement nhận diện bảng."},
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    # ---- ZIP toàn bộ ----
-    zip_name = f"{job_id}.zip"
-    zip_path = os.path.join(BUNDLE_DIR, zip_name)
-
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(workdir):
-            for filename in files:
-                full = os.path.join(root, filename)
-                rel = os.path.relpath(full, workdir)
-                z.write(full, arcname=rel)
-
-    return {
-        "zip_name": zip_name,
-        "zip_path": zip_path,
-        "page_count": len(results),
-        "total_chars": total_chars,
-        "warnings": [r["warning"] for r in results if r["warning"]],
-    }
+    return zip_path
 
 
-# ============================================
-# ROUTES
-# ============================================
-
+# =========================
+# API: OCR via URL
+# =========================
 @app.post("/ocr/pdf")
-async def ocr_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="File phải là PDF")
+async def ocr_pdf_url(payload: OCRUrlRequest):
+    file_url = payload.file_url
 
-    job_id = str(uuid.uuid4())
-    pdf_path = os.path.join(UPLOAD_DIR, f"{job_id}.pdf")
+    # 1. Download PDF
+    try:
+        response = requests.get(file_url, timeout=15)
+        response.raise_for_status()
+        pdf_bytes = response.content
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unable to download file_url")
 
-    with open(pdf_path, "wb") as f:
-        f.write(await file.read())
+    # 2. Save temp PDF
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        pdf_path = tmp.name
 
-    meta = build_bundle(pdf_path, job_id)
-    zip_url = f"{BASE_URL}/files/{meta['zip_name']}"
+    # 3. Build OCR ZIP bundle
+    zip_path = build_bundle(pdf_path)
+    zip_filename = os.path.basename(zip_path)
 
-    return {
-        "job_id": job_id,
-        "zip_url": zip_url,
-        "page_count": meta["page_count"],
-        "total_chars": meta["total_chars"],
-        "warnings": meta["warnings"],
-    }
+    # 4. Build URL for user to download ZIP
+    download_url = f"{BASE_URL}/files/{zip_filename}"
+
+    return {"download_url": download_url}
 
 
+# =========================
+# Serve ZIP files
+# =========================
 @app.get("/files/{filename}")
 async def download_file(filename: str):
-    path = os.path.join(BUNDLE_DIR, filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Không tìm thấy file")
+    file_path = os.path.join("/tmp", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type="application/zip", filename=filename)
 
-    return FileResponse(path, media_type="application/zip", filename=filename)
 
-
+# =========================
+# Health check
+# =========================
 @app.get("/health")
 async def health():
     return {"status": "ok"}
